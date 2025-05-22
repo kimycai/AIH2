@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Hysteria2 Linux服务端一键部署脚本
+# Hysteria2 Linux服务端一键部署脚本（增强版）
 # 支持Debian/Ubuntu/CentOS/RHEL等系统
-# 随机生成端口和密码，并自动生成客户端配置
+# 随机生成端口和密码，自动生成客户端配置，增强版版本检测
 
 # 颜色定义
 RED='\033[0;31m'
@@ -35,21 +35,48 @@ else
     exit 1
 fi
 
-# 获取最新版本号
-get_latest_version() {
-    echo -e "${YELLOW}正在获取Hysteria2最新版本...${NC}"
-    VERSION=$(curl -s "https://api.github.com/repos/apernet/hysteria/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    if [ -z "$VERSION" ]; then
-        echo -e "${RED}获取版本号失败，使用默认版本...${NC}"
-        VERSION="v2.5.0"
-    fi
-    echo -e "${GREEN}最新版本: ${VERSION}${NC}"
-    echo "$VERSION"
-}
-
 # 随机生成4位数字端口（1000-9999范围）
 generate_random_port() {
     echo $((1000 + RANDOM % 9000))
+}
+
+# 获取最新版本号（增强版）
+get_latest_version() {
+    echo -e "${YELLOW}正在获取Hysteria2最新版本...${NC}"
+    
+    # 使用GitHub API获取最新版本
+    RESPONSE=$(curl -s -H "Accept: application/vnd.github+json" -H "User-Agent: Hysteria2-Installer" "https://api.github.com/repos/apernet/hysteria/releases/latest")
+    
+    # 检查响应是否包含错误
+    if echo "$RESPONSE" | grep -q "message"; then
+        ERROR=$(echo "$RESPONSE" | grep "message" | sed -E 's/.*"message":\s*"([^"]+)".*/\1/')
+        echo -e "${RED}获取版本号失败: ${ERROR}${NC}"
+        echo -e "${YELLOW}尝试直接访问GitHub页面获取...${NC}"
+        
+        # 备用方法：从GitHub发布页面获取版本
+        VERSION=$(curl -s "https://github.com/apernet/hysteria/releases/latest" | grep -o '/apernet/hysteria/releases/tag/v[0-9.]\+' | awk -F'/' '{print $NF}' | head -1)
+        
+        if [ -z "$VERSION" ]; then
+            echo -e "${RED}备用方法也失败了，使用默认版本...${NC}"
+            VERSION="v2.5.0"
+        fi
+    else
+        # 使用jq解析JSON（如果安装了）
+        if command -v jq &>/dev/null; then
+            VERSION=$(echo "$RESPONSE" | jq -r '.tag_name')
+        else
+            # 回退到正则表达式解析
+            VERSION=$(echo "$RESPONSE" | grep '"tag_name":' | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')
+        fi
+    fi
+    
+    if [ -z "$VERSION" ]; then
+        echo -e "${RED}所有方法都失败了，使用默认版本...${NC}"
+        VERSION="v2.5.0"
+    fi
+    
+    echo -e "${GREEN}最新版本: ${VERSION}${NC}"
+    echo "$VERSION"
 }
 
 # 安装必要工具
@@ -301,7 +328,7 @@ show_config_info() {
 
 # 主函数
 main() {
-    echo -e "${GREEN}==== Hysteria2 一键部署脚本（含客户端配置） ====${NC}"
+    echo -e "${GREEN}==== Hysteria2 一键部署脚本（增强版） ====${NC}"
     
     install_tools
     download_hysteria
