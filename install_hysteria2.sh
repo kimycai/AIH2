@@ -1,355 +1,497 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# install_hysteria2.sh - Hysteria2 官方增强版一键部署脚本
+# 支持随机端口、密码生成及客户端配置自动生成
+# Try `install_hysteria2.sh --help` for usage.
+#
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2023 Aperture Internet Laboratory & 增强功能贡献者
+#
 
-# Hysteria2 Linux服务端一键部署脚本（修复版）
-# 支持Debian/Ubuntu/CentOS/RHEL等系统
-# 随机生成端口和密码，自动生成客户端配置
+set -e
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m' # No Color
 
-# 检查是否为root用户
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}错误: 请使用root用户运行此脚本!${NC}"
-    exit 1
-fi
+###
+# SCRIPT CONFIGURATION
+###
 
-# 定义变量
+# 基础配置（继承官方脚本）
+SCRIPT_NAME="$(basename "$0")"
+EXECUTABLE_INSTALL_PATH="/usr/local/bin/hysteria"
+SYSTEMD_SERVICES_DIR="/etc/systemd/system"
 CONFIG_DIR="/etc/hysteria"
-CONFIG_FILE="${CONFIG_DIR}/config.yaml"
-SERVICE_FILE="/etc/systemd/system/hysteria.service"
-LOG_DIR="/var/log/hysteria"
-BINARY_PATH="/usr/local/bin/hysteria"
+REPO_URL="https://github.com/apernet/hysteria"
+HY2_API_BASE_URL="https://api.hy2.io/v1"
+CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
 
-# 系统检测
-if [ -f /etc/debian_version ]; then
-    SYSTEM="debian"
-    PACKAGE_MANAGER="apt-get"
-elif [ -f /etc/redhat-release ]; then
-    SYSTEM="centos"
-    PACKAGE_MANAGER="yum"
-else
-    echo -e "${RED}不支持的系统!${NC}"
-    exit 1
-fi
+# 增强功能配置
+ENABLE_RANDOM_CONFIG="true"         # 启用随机配置生成
+RANDOM_PORT_MIN=1000                # 随机端口最小值
+RANDOM_PORT_MAX=65535               # 随机端口最大值
+CLIENT_CONFIG_OUTPUT_DIR="$CONFIG_DIR"  # 客户端配置输出目录
 
-# 随机生成4位数字端口（1000-9999范围）
-generate_random_port() {
-    echo $((1000 + RANDOM % 9000))
+
+###
+# AUTO DETECTED GLOBAL VARIABLE
+###
+
+PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
+OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
+ARCHITECTURE="${ARCHITECTURE:-}"
+HYSTERIA_USER="${HYSTERIA_USER:-hysteria}"
+HYSTERIA_HOME_DIR="${HYSTERIA_HOME_DIR:-/var/lib/$HYSTERIA_USER}"
+SECONTEXT_SYSTEMD_UNIT="${SECONTEXT_SYSTEMD_UNIT:-}"
+
+
+###
+# ARGUMENTS
+###
+
+OPERATION=
+VERSION=
+FORCE=
+LOCAL_FILE=
+DISABLE_RANDOM_CONFIG=           # 禁用随机配置生成
+
+
+###
+# 工具函数
+###
+
+has_command() {
+  local _command=$1
+  type -P "$_command" > /dev/null 2>&1
 }
 
-# 获取最新版本号（修复版）
-get_latest_version() {
-    local version=""
-    echo -e "${YELLOW}正在获取Hysteria2最新版本...${NC}"
-    
-    # 使用GitHub API获取最新版本
-    RESPONSE=$(curl -s -H "Accept: application/vnd.github+json" -H "User-Agent: Hysteria2-Installer" "https://api.github.com/repos/apernet/hysteria/releases/latest")
-    
-    # 检查响应是否包含错误
-    if echo "$RESPONSE" | grep -q "message"; then
-        ERROR=$(echo "$RESPONSE" | grep "message" | sed -E 's/.*"message":\s*"([^"]+)".*/\1/')
-        echo -e "${RED}获取版本号失败: ${ERROR}${NC}"
-        echo -e "${YELLOW}尝试直接访问GitHub页面获取...${NC}"
-        
-        # 备用方法：从GitHub发布页面获取版本
-        version=$(curl -s "https://github.com/apernet/hysteria/releases/latest" | grep -o '/apernet/hysteria/releases/tag/v[0-9.]\+' | awk -F'/' '{print $NF}' | head -1)
-        
-        if [ -z "$version" ]; then
-            echo -e "${RED}备用方法也失败了，使用默认版本...${NC}"
-            version="v2.5.0"
-        fi
-    else
-        # 使用jq解析JSON（如果安装了）
-        if command -v jq &>/dev/null; then
-            version=$(echo "$RESPONSE" | jq -r '.tag_name')
-        else
-            # 回退到正则表达式解析
-            version=$(echo "$RESPONSE" | grep '"tag_name":' | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')
-        fi
-    fi
-    
-    if [ -z "$version" ]; then
-        echo -e "${RED}所有方法都失败了，使用默认版本...${NC}"
-        version="v2.5.0"
-    fi
-    
-    echo -e "${GREEN}最新版本: ${version}${NC}"
-    echo "$version"  # 只返回版本号，不包含其他输出
+curl() {
+  command curl "${CURL_FLAGS[@]}" "$@"
 }
 
-# 安装必要工具
-install_tools() {
-    echo -e "${YELLOW}正在安装必要工具...${NC}"
-    if [ "$SYSTEM" = "debian" ]; then
-        $PACKAGE_MANAGER update
-        $PACKAGE_MANAGER install -y wget curl tar systemd openssl jq qrencode
-    else
-        $PACKAGE_MANAGER install -y wget curl tar systemd openssl jq qrencode
-    fi
+tred() {
+  if has_command tput; then
+    tput setaf 1
+  fi
+  echo -n
 }
 
-# 下载Hysteria2
-download_hysteria() {
-    VERSION=$(get_latest_version)
-    echo -e "${YELLOW}正在下载Hysteria2 ${VERSION}...${NC}"
-    
-    # 检测系统架构
-    ARCH=$(uname -m)
-    case $ARCH in
-        x86_64)
-            ARCH="amd64"
-            ;;
-        aarch64)
-            ARCH="arm64"
-            ;;
-        armv7l)
-            ARCH="armv7"
-            ;;
-        *)
-            echo -e "${RED}不支持的架构: ${ARCH}${NC}"
-            exit 1
-            ;;
+tgreen() {
+  if has_command tput; then
+    tput setaf 2
+  fi
+  echo -n
+}
+
+tyellow() {
+  if has_command tput; then
+    tput setaf 3
+  fi
+  echo -n
+}
+
+tblue() {
+  if has_command tput; then
+    tput setaf 4
+  fi
+  echo -n
+}
+
+tbold() {
+  if has_command tput; then
+    tput bold
+  fi
+  echo -n
+}
+
+treset() {
+  if has_command tput; then
+    tput sgr0
+  fi
+  echo -n
+}
+
+note() {
+  local _msg="$1"
+  echo -e "$SCRIPT_NAME: $(tbold)note: $_msg$(treset)"
+}
+
+warning() {
+  local _msg="$1"
+  echo -e "$SCRIPT_NAME: $(tyellow)warning: $_msg$(treset)"
+}
+
+error() {
+  local _msg="$1"
+  echo -e "$SCRIPT_NAME: $(tred)error: $_msg$(treset)"
+}
+
+systemctl() {
+  if [[ "x$FORCE_NO_SYSTEMD" == "x2" ]] || ! has_command systemctl; then
+    warning "Ignored systemd command: systemctl $@"
+    return
+  fi
+  command systemctl "$@"
+}
+
+detect_package_manager() {
+  if [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]]; then
+    return 0
+  fi
+
+  if has_command apt; then
+    apt update
+    PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install'
+    return 0
+  fi
+
+  if has_command dnf; then
+    PACKAGE_MANAGEMENT_INSTALL='dnf -y install'
+    return 0
+  fi
+
+  if has_command yum; then
+    PACKAGE_MANAGEMENT_INSTALL='yum -y install'
+    return 0
+  fi
+
+  if has_command zypper; then
+    PACKAGE_MANAGEMENT_INSTALL='zypper install -y --no-recommends'
+    return 0
+  fi
+
+  if has_command pacman; then
+    PACKAGE_MANAGEMENT_INSTALL='pacman -Syu --noconfirm'
+    return 0
+  fi
+
+  return 1
+}
+
+install_software() {
+  local _package_name="$1"
+  if ! detect_package_manager; then
+    error "不支持的包管理器，请手动安装: $_package_name"
+    exit 65
+  fi
+  echo "正在安装依赖: $_package_name ..."
+  if $PACKAGE_MANAGEMENT_INSTALL "$_package_name"; then
+    echo "完成"
+  else
+    error "安装依赖失败，请手动安装 $_package_name"
+    exit 65
+  fi
+}
+
+check_permission() {
+  if [[ "$UID" -eq '0' ]]; then
+    return
+  fi
+  note "当前用户不是root"
+  case "$FORCE_NO_ROOT" in
+    '1')
+      warning "FORCE_NO_ROOT=1，将以当前用户继续，但可能出现权限不足"
+      ;;
+    *)
+      if ! has_command sudo; then
+        error "请使用root用户或安装sudo"
+        exit 13
+      fi
+      note "将使用sudo重新运行脚本"
+      local _tmp_script=$(mktemp)
+      chmod +x "$_tmp_script"
+      if has_command curl; then
+        curl -o "$_tmp_script" "$0"
+      elif has_command wget; then
+        wget -O "$_tmp_script" "$0"
+      else
+        error "未安装curl或wget，无法重新运行"
+        exit 127
+      fi
+      exec sudo env "$0=$_tmp_script" "$@"
+      ;;
+  esac
+}
+
+check_environment() {
+  if [[ -n "$OPERATING_SYSTEM" ]]; then
+    warning "已指定OPERATING_SYSTEM=$OPERATING_SYSTEM，跳过系统检测"
+  elif [[ "x$(uname)" != "xLinux" ]]; then
+    error "仅支持Linux系统"
+    exit 95
+  else
+    OPERATING_SYSTEM=linux
+  fi
+
+  if [[ -n "$ARCHITECTURE" ]]; then
+    warning "已指定ARCHITECTURE=$ARCHITECTURE，跳过架构检测"
+  else
+    case "$(uname -m)" in
+      'i386' | 'i686') ARCHITECTURE='386' ;;
+      'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
+      'armv5tel' | 'armv6l' | 'armv7' | 'armv7l') ARCHITECTURE='arm' ;;
+      'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
+      'mips' | 'mipsle' | 'mips64' | 'mips64le') ARCHITECTURE='mipsle' ;;
+      's390x') ARCHITECTURE='s390x' ;;
+      'loongarch64') ARCHITECTURE='loong64' ;;
+      *)
+        error "不支持的架构: $(uname -m)"
+        exit 8
+        ;;
     esac
-    
-    # 下载二进制文件
-    DOWNLOAD_URL="https://github.com/apernet/hysteria/releases/download/${VERSION}/hysteria-linux-${ARCH}-avx"
-    TEMP_FILE="/tmp/hysteria-linux-${ARCH}-avx"
-    
-    echo -e "${YELLOW}下载URL: ${DOWNLOAD_URL}${NC}"  # 调试输出
-    
-    if ! wget -q -O "$TEMP_FILE" "$DOWNLOAD_URL"; then
-        echo -e "${RED}下载失败: ${DOWNLOAD_URL}${NC}"
-        
-        # 尝试备用URL格式（移除前缀）
-        CLEAN_VERSION=$(echo "$VERSION" | sed 's/^app\///')
-        DOWNLOAD_URL="https://github.com/apernet/hysteria/releases/download/${CLEAN_VERSION}/hysteria-linux-${ARCH}-avx"
-        echo -e "${YELLOW}尝试备用URL: ${DOWNLOAD_URL}${NC}"
-        
-        if ! wget -q -O "$TEMP_FILE" "$DOWNLOAD_URL"; then
-            echo -e "${RED}备用URL下载也失败了，请检查网络连接或手动下载${NC}"
-            exit 1
-        fi
+  fi
+
+  if [[ -d "/run/systemd/system" ]] || grep -q systemd <(ls -l /sbin/init); then
+    :
+  else
+    case "$FORCE_NO_SYSTEMD" in
+      '1') warning "FORCE_NO_SYSTEMD=1，将继续假设systemd存在" ;;
+      '2') warning "FORCE_NO_SYSTEMD=2，将跳过所有systemd操作" ;;
+      *)
+        error "仅支持systemd系统"
+        exit 95
+        ;;
+    esac
+  fi
+
+  if has_command getenforce; then
+    note "检测到SELinux"
+    if [[ "x$FORCE_NO_SELINUX" == "x1" ]]; then
+      warning "FORCE_NO_SELINUX=1，将跳过SELinux操作"
+    elif [[ -z "$SECONTEXT_SYSTEMD_UNIT" ]] && [[ -e "$SYSTEMD_SERVICES_DIR" ]]; then
+      SECONTEXT_SYSTEMD_UNIT=$(get_selinux_context "$SYSTEMD_SERVICES_DIR")
     fi
-    
-    # 赋予执行权限并移动到指定位置
-    chmod +x "$TEMP_FILE"
-    mv "$TEMP_FILE" "$BINARY_PATH"
-    
-    if [ ! -f "$BINARY_PATH" ]; then
-        echo -e "${RED}Hysteria2安装失败!${NC}"
-        exit 1
-    fi
-    
-    echo -e "${GREEN}Hysteria2安装成功!${NC}"
+  fi
+
+  if ! has_command curl; then
+    install_software curl
+  fi
 }
 
-# 配置Hysteria2
-configure_hysteria() {
-    echo -e "${YELLOW}正在配置Hysteria2...${NC}"
-    
-    # 创建配置目录
-    mkdir -p "$CONFIG_DIR"
-    mkdir -p "$LOG_DIR"
-    
-    # 生成随机密码
-    AUTH_PASSWORD=$(openssl rand -base64 16 | tr -d '+/=' | cut -c1-16)
-    OBFS_PASSWORD=$(openssl rand -base64 16 | tr -d '+/=' | cut -c1-16)
-    
-    # 生成随机端口
-    SERVER_PORT=$(generate_random_port)
-    
-    # 获取服务器公网IP
-    SERVER_IP=$(curl -s ifconfig.me)
-    
-    # 生成自签名证书
-    echo -e "${YELLOW}正在生成自签名证书...${NC}"
-    CERT_DIR="${CONFIG_DIR}/certs"
-    mkdir -p "$CERT_DIR"
-    
-    openssl req -x509 -newkey rsa:4096 -keyout "$CERT_DIR/private.key" -out "$CERT_DIR/cert.crt" -days 3650 -nodes -subj "/CN=$SERVER_IP" -addext "subjectAltName = IP:$SERVER_IP"
-    
-    if [ ! -f "$CERT_DIR/cert.crt" ] || [ ! -f "$CERT_DIR/private.key" ]; then
-        echo -e "${RED}自签名证书生成失败!${NC}"
-        exit 1
-    fi
-    
-    # 创建配置文件（使用随机参数）
-    cat > "$CONFIG_FILE" << EOF
-# Hysteria2 服务器配置
-listen: :$SERVER_PORT
-tls:
-  cert: $CERT_DIR/cert.crt
-  key: $CERT_DIR/private.key
+get_selinux_context() {
+  local _file="$1"
+  local _lsres=$(ls -dZ "$_file" 2>/dev/null | head -1)
+  local _sectx=''
+  case "$(echo "$_lsres" | wc -w)" in
+    2) _sectx=$(echo "$_lsres" | cut -d ' ' -f 1) ;;
+    5) _sectx=$(echo "$_lsres" | cut -d ' ' -f 4) ;;
+  esac
+  echo "$_sectx"
+}
+
+
+###
+# 增强功能：随机配置生成
+###
+
+# 生成随机端口
+generate_random_port() {
+  if [[ "$DISABLE_RANDOM_CONFIG" == "true" ]]; then
+    echo "443"
+    return
+  fi
+  echo $((RANDOM_PORT_MIN + RANDOM % (RANDOM_PORT_MAX - RANDOM_PORT_MIN + 1)))
+}
+
+# 生成随机密码
+generate_random_password() {
+  if [[ "$DISABLE_RANDOM_CONFIG" == "true" ]]; then
+    echo "hysteria2_default_password"
+    return
+  fi
+  dd if=/dev/random bs=16 count=1 status=none | base64 | tr -d '+/=' | cut -c1-16
+}
+
+# 生成客户端配置URI
+generate_client_uri() {
+  local server_ip=$(curl -s ifconfig.me)
+  local port=$(generate_random_port)
+  local auth_pass=$(generate_random_password)
+  local obfs_pass=$(generate_random_password)
+  echo "hysteria2://${auth_pass}@${server_ip}:${port}/?obfs=salamander&obfs-password=${obfs_pass}&insecure=1"
+}
+
+# 输出客户端配置信息
+output_client_config() {
+  local uri=$(generate_client_uri)
+  local server_ip=$(echo $uri | grep -oP '@[^:]+:' | cut -d@ -f2 | cut -d: -f1)
+  local port=$(echo $uri | grep -oP ':\d+' | cut -d: -f2)
+  local auth_pass=$(echo $uri | grep -oP '@[^:]+:' | cut -d@ -f2 | cut -d: -f1)
+  local obfs_pass=$(echo $uri | grep -oP 'obfs-password=[^&]+' | cut -d= -f2)
+  
+  mkdir -p "$CLIENT_CONFIG_OUTPUT_DIR"
+  cat > "$CLIENT_CONFIG_OUTPUT_DIR/client_info.txt" << EOF
+==== Hysteria2 客户端配置信息 ====
+服务器IP: ${server_ip}
+随机端口: ${port}
+认证密码: ${auth_pass}
+混淆密码: ${obfs_pass}
+
+客户端连接URI:
+${uri}
+
+使用说明:
+1. 将URI导入Hysteria2客户端（需允许不安全连接）
+2. 或手动配置:
+   - 服务器地址: ${server_ip}:${port}
+   - 认证密码: ${auth_pass}
+   - 混淆类型: salamander
+   - 混淆密码: ${obfs_pass}
+   - 安全设置: 忽略证书验证
+EOF
+  
+  echo -e "\n$(tgreen)客户端配置已保存至: $(tbold)$CLIENT_CONFIG_OUTPUT_DIR/client_info.txt$(treset)"
+  echo -e "$(tgreen)URI链接:$(treset) $(tblue)$uri$(treset)"
+  
+  # 尝试生成二维码
+  if has_command qrencode; then
+    echo -e "\n$(tgreen)扫描二维码导入配置:$(treset)"
+    qrencode -t ansiutf8 "$uri"
+  fi
+}
+
+# 生成配置文件内容
+tpl_etc_hysteria_config_yaml() {
+  local port=$(generate_random_port)
+  local auth_pass=$(generate_random_password)
+  local obfs_pass=$(generate_random_password)
+  
+  cat << EOF
+# Hysteria2 自动配置 (随机生成)
+listen: :$port
+
 auth:
   type: password
-  password: $AUTH_PASSWORD
+  password: $auth_pass
+
 obfs:
   type: salamander
   salamander:
-    password: $OBFS_PASSWORD
-bandwidth:
-  up: 100 mbps
-  down: 100 mbps
-quic:
-  initStreamReceiveWindow: 8388608
-  maxStreamReceiveWindow: 8388608
-  initConnReceiveWindow: 20971520
-  maxConnReceiveWindow: 20971520
+    password: $obfs_pass
+
+# 证书配置（建议使用ACME自动申请）
+# acme:
+#   domains:
+#     - your.domain.com
+#   email: your@email.com
+
+# 带宽限制 (可选)
+# bandwidth:
+#   up: 100 mbps
+#   down: 100 mbps
+
+# QUIC配置 (可选)
+# quic:
+#   initialStreamReceiveWindow: 8388608
+#   maxStreamReceiveWindow: 8388608
+#   initialConnectionReceiveWindow: 20971520
+#   maxConnectionReceiveWindow: 20971520
 EOF
-    
-    echo -e "${GREEN}Hysteria2配置文件创建成功!${NC}"
-    echo -e "${YELLOW}随机生成的认证密码: ${AUTH_PASSWORD}${NC}"
-    echo -e "${YELLOW}随机生成的混淆密码: ${OBFS_PASSWORD}${NC}"
-    echo -e "${YELLOW}随机生成的服务端口: ${SERVER_PORT}${NC}"
-    echo -e "${YELLOW}自签名证书路径: ${CERT_DIR}/cert.crt${NC}"
-    
-    # 生成客户端配置URI
-    CLIENT_URI="hysteria2://${AUTH_PASSWORD}@${SERVER_IP}:${SERVER_PORT}/?obfs=salamander&obfs-password=${OBFS_PASSWORD}&insecure=1"
-    echo -e "${YELLOW}客户端配置URI: ${CLIENT_URI}${NC}"
-    
-    # 保存配置信息到文件
-    cat > "${CONFIG_DIR}/client_info.txt" << EOF
-Hysteria2 客户端配置信息
-
-服务器IP: ${SERVER_IP}
-认证密码: ${AUTH_PASSWORD}
-混淆密码: ${OBFS_PASSWORD}
-服务端口: ${SERVER_PORT}
-
-客户端URI: ${CLIENT_URI}
-
-使用说明:
-1. 将此URI导入到Hysteria2客户端应用中
-2. 或使用以下命令启动客户端:
-   hysteria-linux-amd64 client -c <(echo '{"server":"${SERVER_IP}:${SERVER_PORT}","auth":"${AUTH_PASSWORD}","obfs":"salamander","obfsPassword":"${OBFS_PASSWORD}","insecure":true,"socks5":{"listen":"127.0.0.1:1080"},"http":{"listen":"127.0.0.1:8080"}}')
-EOF
-    
-    echo -e "${GREEN}客户端配置信息已保存到: ${CONFIG_DIR}/client_info.txt${NC}"
 }
 
-# 创建systemd服务
-create_service() {
-    echo -e "${YELLOW}正在创建systemd服务...${NC}"
-    
-    cat > "$SERVICE_FILE" << EOF
-[Unit]
-Description=Hysteria2 Server
-After=network.target
 
-[Service]
-ExecStart=$BINARY_PATH server -c $CONFIG_FILE
-Restart=always
-RestartSec=3
-LimitNOFILE=65535
-StandardOutput=append:$LOG_DIR/server.log
-StandardError=append:$LOG_DIR/error.log
+###
+# 版本相关函数
+###
 
-[Install]
-WantedBy=multi-user.target
-EOF
-    
-    # 重载systemd
-    systemctl daemon-reload
-    
-    # 启用服务
-    systemctl enable hysteria.service
-    
-    echo -e "${GREEN}systemd服务创建成功!${NC}"
+is_hysteria_installed() {
+  [[ -f "$EXECUTABLE_INSTALL_PATH" || -h "$EXECUTABLE_INSTALL_PATH" ]]
 }
 
-# 启动Hysteria2
-start_hysteria() {
-    echo -e "${YELLOW}正在启动Hysteria2服务...${NC}"
-    
-    systemctl start hysteria.service
-    
-    # 检查服务状态
-    if ! systemctl is-active --quiet hysteria.service; then
-        echo -e "${RED}Hysteria2服务启动失败!${NC}"
-        echo -e "${YELLOW}查看服务状态: systemctl status hysteria${NC}"
-        echo -e "${YELLOW}查看服务日志: journalctl -u hysteria -f${NC}"
-        exit 1
+is_hysteria1_version() {
+  local _version="$1"
+  [[ "$_version" == v1.* || "$_version" == v0.* ]]
+}
+
+get_installed_version() {
+  if is_hysteria_installed; then
+    if "$EXECUTABLE_INSTALL_PATH" version > /dev/null 2>&1; then
+      "$EXECUTABLE_INSTALL_PATH" version | grep '^Version' | grep -o 'v[.0-9]*'
+    elif "$EXECUTABLE_INSTALL_PATH" -v > /dev/null 2>&1; then
+      "$EXECUTABLE_INSTALL_PATH" -v | cut -d ' ' -f 3
     fi
-    
-    echo -e "${GREEN}Hysteria2服务启动成功!${NC}"
+  fi
 }
 
-# 配置防火墙
-configure_firewall() {
-    echo -e "${YELLOW}正在配置防火墙...${NC}"
-    
-    if [ "$SYSTEM" = "debian" ]; then
-        if command -v ufw &>/dev/null; then
-            ufw allow $SERVER_PORT/udp
-            ufw allow $SERVER_PORT/tcp
-            echo -e "${GREEN}ufw防火墙配置成功!${NC}"
-        else
-            echo -e "${YELLOW}未找到ufw，跳过防火墙配置...${NC}"
-            echo -e "${YELLOW}请手动开放${SERVER_PORT}端口(UDP和TCP)${NC}"
-        fi
-    else
-        if command -v firewalld &>/dev/null; then
-            firewall-cmd --permanent --add-port=$SERVER_PORT/udp
-            firewall-cmd --permanent --add-port=$SERVER_PORT/tcp
-            firewall-cmd --reload
-            echo -e "${GREEN}firewalld防火墙配置成功!${NC}"
-        else
-            echo -e "${YELLOW}未找到firewalld，跳过防火墙配置...${NC}"
-            echo -e "${YELLOW}请手动开放${SERVER_PORT}端口(UDP和TCP)${NC}"
-        fi
+get_latest_version() {
+  if [[ -n "$VERSION" ]]; then
+    echo "$VERSION"
+    return
+  fi
+
+  local _tmpfile=$(mktemp)
+  if ! curl -sS "$HY2_API_BASE_URL/update?cver=installscript&plat=${OPERATING_SYSTEM}&arch=${ARCHITECTURE}&chan=release&side=server" -o "$_tmpfile"; then
+    error "无法获取最新版本信息，请检查网络"
+    exit 11
+  fi
+
+  local _latest_version=$(grep -oP '"lver":\s*\K"v.*?"' "$_tmpfile" | head -1)
+  _latest_version=${_latest_version#'"'}
+  _latest_version=${_latest_version%'"'}
+
+  if [[ -n "$_latest_version" ]]; then
+    echo "$_latest_version"
+  else
+    error "无法解析版本信息，使用默认版本"
+    echo "v2.6.1"
+  fi
+
+  rm -f "$_tmpfile"
+}
+
+check_update() {
+  local _installed=$(get_installed_version)
+  local _latest=$(get_latest_version)
+  
+  echo -ne "已安装版本: "
+  if [[ -n "$_installed" ]]; then
+    echo "$_installed"
+  else
+    echo "未安装"
+  fi
+
+  echo -ne "最新版本: "
+  echo "$_latest"
+
+  if [[ -z "$_installed" || $(vercmp "$_installed" "$_latest") -lt 0 ]]; then
+    return 0  # 有更新
+  fi
+  return 1  # 已是最新
+}
+
+vercmp() {
+  local _lhs=${1#v}
+  local _rhs=${2#v}
+  local _clhs _crhs _segcmp
+
+  while [[ -n "$_lhs" && -n "$_rhs" ]]; do
+    _clhs=${_lhs/.*/}
+    _crhs=${_rhs/.*/}
+
+    _clhs=${_clhs//[A-Za-z]*/}
+    _crhs=${_crhs//[A-Za-z]*/}
+
+    if [[ "$_clhs" -ne "$_crhs" ]]; then
+      echo $((_clhs - _crhs))
+      return
     fi
+
+    _lhs=${_lhs#"$_clhs"}
+    _lhs=${_lhs#.}
+    _rhs=${_rhs#"$_crhs"}
+    _rhs=${_rhs#.}
+  done
+
+  if [[ -z "$_lhs" && -z "$_rhs" ]]; then
+    echo 0
+  elif [[ -z "$_lhs" ]]; then
+    echo -1
+  else
+    echo 1
+  fi
 }
 
-# 显示配置信息和客户端二维码
-show_config_info() {
-    echo -e "\n${GREEN}==== Hysteria2 部署完成 ====${NC}"
-    echo -e "${YELLOW}服务器IP: ${SERVER_IP}${NC}"
-    echo -e "${YELLOW}随机生成的认证密码: ${AUTH_PASSWORD}${NC}"
-    echo -e "${YELLOW}随机生成的混淆密码: ${OBFS_PASSWORD}${NC}"
-    echo -e "${YELLOW}随机生成的服务端口: ${SERVER_PORT}${NC}"
-    echo -e "${YELLOW}自签名证书路径: ${CONFIG_DIR}/certs/cert.crt${NC}"
-    echo -e "${YELLOW}配置文件: ${CONFIG_FILE}${NC}"
-    echo -e "${YELLOW}服务控制:${NC}"
-    echo -e "  启动: ${GREEN}systemctl start hysteria${NC}"
-    echo -e "  停止: ${RED}systemctl stop hysteria${NC}"
-    echo -e "  重启: ${YELLOW}systemctl restart hysteria${NC}"
-    echo -e "  状态: ${YELLOW}systemctl status hysteria${NC}"
-    
-    # 生成客户端配置URI
-    CLIENT_URI="hysteria2://${AUTH_PASSWORD}@${SERVER_IP}:${SERVER_PORT}/?obfs=salamander&obfs-password=${OBFS_PASSWORD}&insecure=1"
-    
-    echo -e "\n${GREEN}==== 客户端配置信息 ====${NC}"
-    echo -e "${YELLOW}客户端URI:${NC}"
-    echo -e "${GREEN}${CLIENT_URI}${NC}"
-    
-    # 生成二维码
-    echo -e "\n${YELLOW}扫描下方二维码导入配置:${NC}"
-    qrencode -t ansiutf8 "$CLIENT_URI"
-    
-    echo -e "\n${YELLOW}客户端配置信息已保存到: ${CONFIG_DIR}/client_info.txt${NC}"
-    echo -e "${YELLOW}你可以将此文件分享给其他需要连接的用户${NC}"
-    
-    echo -e "\n${YELLOW}注意:${NC}"
-    echo -e "  1. 由于使用自签名证书，客户端连接时需要添加 &insecure=1 参数"
-    echo -e "  2. 请妥善保管你的认证密码和混淆密码"
-    echo -e "  3. 如需修改配置，请编辑 ${CONFIG_FILE} 并重启服务"
-}
 
-# 主函数
-main() {
-    echo -e "${GREEN}==== Hysteria2 一键部署脚本（修复版） ====${NC}"
-    
-    install_tools
-    download_hysteria
-    configure_hysteria
-    create_service
-    start_hysteria
-    configure_firewall
-    show_config_info
-}
+###
+# 安装与服务管理
+###
 
-# 执行主函数
-main    
+perform_install_hysteria
