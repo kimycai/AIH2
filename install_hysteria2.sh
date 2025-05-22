@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Hysteria2 Linux服务端一键部署脚本（增强版）
+# Hysteria2 Linux服务端一键部署脚本（修复版）
 # 支持Debian/Ubuntu/CentOS/RHEL等系统
-# 随机生成端口和密码，自动生成客户端配置，增强版版本检测
+# 随机生成端口和密码，自动生成客户端配置
 
 # 颜色定义
 RED='\033[0;31m'
@@ -40,8 +40,9 @@ generate_random_port() {
     echo $((1000 + RANDOM % 9000))
 }
 
-# 获取最新版本号（增强版）
+# 获取最新版本号（修复版）
 get_latest_version() {
+    local version=""
     echo -e "${YELLOW}正在获取Hysteria2最新版本...${NC}"
     
     # 使用GitHub API获取最新版本
@@ -54,29 +55,29 @@ get_latest_version() {
         echo -e "${YELLOW}尝试直接访问GitHub页面获取...${NC}"
         
         # 备用方法：从GitHub发布页面获取版本
-        VERSION=$(curl -s "https://github.com/apernet/hysteria/releases/latest" | grep -o '/apernet/hysteria/releases/tag/v[0-9.]\+' | awk -F'/' '{print $NF}' | head -1)
+        version=$(curl -s "https://github.com/apernet/hysteria/releases/latest" | grep -o '/apernet/hysteria/releases/tag/v[0-9.]\+' | awk -F'/' '{print $NF}' | head -1)
         
-        if [ -z "$VERSION" ]; then
+        if [ -z "$version" ]; then
             echo -e "${RED}备用方法也失败了，使用默认版本...${NC}"
-            VERSION="v2.5.0"
+            version="v2.5.0"
         fi
     else
         # 使用jq解析JSON（如果安装了）
         if command -v jq &>/dev/null; then
-            VERSION=$(echo "$RESPONSE" | jq -r '.tag_name')
+            version=$(echo "$RESPONSE" | jq -r '.tag_name')
         else
             # 回退到正则表达式解析
-            VERSION=$(echo "$RESPONSE" | grep '"tag_name":' | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')
+            version=$(echo "$RESPONSE" | grep '"tag_name":' | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')
         fi
     fi
     
-    if [ -z "$VERSION" ]; then
+    if [ -z "$version" ]; then
         echo -e "${RED}所有方法都失败了，使用默认版本...${NC}"
-        VERSION="v2.5.0"
+        version="v2.5.0"
     fi
     
-    echo -e "${GREEN}最新版本: ${VERSION}${NC}"
-    echo "$VERSION"
+    echo -e "${GREEN}最新版本: ${version}${NC}"
+    echo "$version"  # 只返回版本号，不包含其他输出
 }
 
 # 安装必要工具
@@ -117,9 +118,20 @@ download_hysteria() {
     DOWNLOAD_URL="https://github.com/apernet/hysteria/releases/download/${VERSION}/hysteria-linux-${ARCH}-avx"
     TEMP_FILE="/tmp/hysteria-linux-${ARCH}-avx"
     
+    echo -e "${YELLOW}下载URL: ${DOWNLOAD_URL}${NC}"  # 调试输出
+    
     if ! wget -q -O "$TEMP_FILE" "$DOWNLOAD_URL"; then
         echo -e "${RED}下载失败: ${DOWNLOAD_URL}${NC}"
-        exit 1
+        
+        # 尝试备用URL格式（移除前缀）
+        CLEAN_VERSION=$(echo "$VERSION" | sed 's/^app\///')
+        DOWNLOAD_URL="https://github.com/apernet/hysteria/releases/download/${CLEAN_VERSION}/hysteria-linux-${ARCH}-avx"
+        echo -e "${YELLOW}尝试备用URL: ${DOWNLOAD_URL}${NC}"
+        
+        if ! wget -q -O "$TEMP_FILE" "$DOWNLOAD_URL"; then
+            echo -e "${RED}备用URL下载也失败了，请检查网络连接或手动下载${NC}"
+            exit 1
+        fi
     fi
     
     # 赋予执行权限并移动到指定位置
@@ -328,7 +340,7 @@ show_config_info() {
 
 # 主函数
 main() {
-    echo -e "${GREEN}==== Hysteria2 一键部署脚本（增强版） ====${NC}"
+    echo -e "${GREEN}==== Hysteria2 一键部署脚本（修复版） ====${NC}"
     
     install_tools
     download_hysteria
