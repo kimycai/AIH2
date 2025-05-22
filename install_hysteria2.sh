@@ -494,4 +494,236 @@ vercmp() {
 # 安装与服务管理
 ###
 
-perform_install_hysteria
+perform_install_hysteria_binary() {
+  if [[ -n "$LOCAL_FILE" ]]; then
+    note "安装本地二进制文件: $LOCAL_FILE"
+    if install -Dm755 "$LOCAL_FILE" "$EXECUTABLE_INSTALL_PATH"; then
+      echo "安装成功"
+    else
+      error "安装失败"
+      exit 2
+    fi
+    return
+  fi
+
+  local _tmpfile=$(mktemp)
+  local _version=$(get_latest_version)
+
+  echo "下载 hysteria 二进制文件: $_version ..."
+  if ! download_hysteria "$_version" "$_tmpfile"; then
+    rm -f "$_tmpfile"
+    exit 11
+  fi
+
+  if install -Dm755 "$_tmpfile" "$EXECUTABLE_INSTALL_PATH"; then
+    echo "安装成功"
+  else
+    error "安装失败"
+    exit 13
+  fi
+
+  rm -f "$_tmpfile"
+}
+
+download_hysteria() {
+  local _version="$1"
+  local _destination="$2"
+  local _download_url="$REPO_URL/releases/download/app/$_version/hysteria-$OPERATING_SYSTEM-$ARCHITECTURE"
+  
+  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
+    error "下载失败，请检查网络连接"
+    return 11
+  fi
+  return 0
+}
+
+perform_install_hysteria_config() {
+  # 生成随机配置并安装
+  install_content -Dm644 "$(tpl_etc_hysteria_config_yaml)" "$CONFIG_DIR/config.yaml" "1"
+  echo -e "$(tgreen)随机配置生成成功:$(treset) $(tbold)$CONFIG_DIR/config.yaml$(treset)"
+}
+
+# 安装systemd服务文件
+perform_install_hysteria_systemd() {
+  if [[ "x$FORCE_NO_SYSTEMD" == "x2" ]]; then
+    return
+  fi
+
+  install_content -Dm644 "$(tpl_hysteria_server_service)" "$SYSTEMD_SERVICES_DIR/hysteria-server.service" "1"
+  install_content -Dm644 "$(tpl_hysteria_server_x_service)" "$SYSTEMD_SERVICES_DIR/hysteria-server@.service" "1"
+  
+  if [[ -n "$SECONTEXT_SYSTEMD_UNIT" ]]; then
+    chcon "$SECONTEXT_SYSTEMD_UNIT" "$SYSTEMD_SERVICES_DIR/hysteria-server.service"
+    chcon "$SECONTEXT_SYSTEMD_UNIT" "$SYSTEMD_SERVICES_DIR/hysteria-server@.service"
+  fi
+
+  systemctl daemon-reload
+}
+
+# 模板：hysteria-server.service
+tpl_hysteria_server_service() {
+  cat << EOF
+[Unit]
+Description=Hysteria Server Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$EXECUTABLE_INSTALL_PATH server --config $CONFIG_DIR/config.yaml
+WorkingDirectory=$HYSTERIA_HOME_DIR
+User=$HYSTERIA_USER
+Group=$HYSTERIA_USER
+Environment=HYSTERIA_LOG_LEVEL=info
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# 模板：hysteria-server@.service
+tpl_hysteria_server_x_service() {
+  cat << EOF
+[Unit]
+Description=Hysteria Server Service (%i)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$EXECUTABLE_INSTALL_PATH server --config $CONFIG_DIR/%i.yaml
+WorkingDirectory=$HYSTERIA_HOME_DIR
+User=$HYSTERIA_USER
+Group=$HYSTERIA_USER
+Environment=HYSTERIA_LOG_LEVEL=info
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# 安装内容到目标位置
+install_content() {
+  local _install_flags="$1"
+  local _content="$2"
+  local _destination="$3"
+  local _overwrite="${4:-}"
+
+  local _tmpfile=$(mktemp)
+  echo "$_content" > "$_tmpfile"
+
+  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
+    echo -e "已存在: $_destination"
+  elif install $_install_flags "$_tmpfile" "$_destination"; then
+    echo -e "已安装: $_destination"
+  else
+    echo -e "安装失败: $_destination"
+    return 1
+  fi
+
+  rm -f "$_tmpfile"
+}
+
+# 启动服务
+start_service() {
+  echo -ne "启动Hysteria服务 ... "
+  systemctl start hysteria-server.service
+  systemctl enable hysteria-server.service
+  echo "完成"
+}
+
+# 检查服务状态
+check_service_status() {
+  echo -e "\n$(tbold)检查Hysteria服务状态:$(treset)"
+  systemctl status hysteria-server.service --no-pager || true
+}
+
+
+###
+# 主函数
+###
+
+perform_install() {
+  echo -e "$(tbold)开始安装Hysteria2$(treset)"
+  
+  # 安装二进制文件
+  perform_install_hysteria_binary
+  
+  # 安装配置文件
+  perform_install_hysteria_config
+  
+  # 创建服务用户
+  if ! id "$HYSTERIA_USER" &>/dev/null; then
+    echo -e "\n$(tbold)创建服务用户: $HYSTERIA_USER$(treset)"
+    useradd -r -m -d "$HYSTERIA_HOME_DIR" -s /sbin/nologin "$HYSTERIA_USER"
+    chown -R "$HYSTERIA_USER:$HYSTERIA_USER" "$HYSTERIA_HOME_DIR"
+  fi
+  
+  # 安装systemd服务
+  perform_install_hysteria_systemd
+  
+  # 启动服务
+  start_service
+  
+  # 输出客户端配置
+  output_client_config
+  
+  # 检查服务状态
+  check_service_status
+  
+  echo -e "\n$(tgreen)Hysteria2 安装完成!$(treset)"
+  echo -e "服务配置: $(tblue)systemctl [start|stop|restart|status] hysteria-server.service$(treset)"
+  echo -e "配置文件: $(tblue)$CONFIG_DIR/config.yaml$(treset)"
+}
+
+parse_arguments() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --disable-random)
+        DISABLE_RANDOM_CONFIG="true"
+        ;;
+      --version)
+        VERSION="$2"
+        if [[ -z "$VERSION" ]]; then
+          error "请指定版本号"
+          exit 1
+        fi
+        shift
+        ;;
+      --help|-h)
+        echo "Hysteria2 一键部署脚本"
+        echo "用法:"
+        echo "  $0 [选项]"
+        echo "选项:"
+        echo "  --disable-random    禁用随机配置，使用默认值"
+        echo "  --version <版本>    安装指定版本"
+        echo "  --help, -h          显示此帮助信息"
+        exit 0
+        ;;
+      *)
+        error "未知参数: $1"
+        exit 1
+        ;;
+    esac
+    shift
+  done
+}
+
+main() {
+  parse_arguments "$@"
+  check_permission
+  check_environment
+  
+  echo -e "$(tgreen)系统环境检查通过:$(treset)"
+  echo -e "  操作系统: $(tbold)$OPERATING_SYSTEM$(treset)"
+  echo -e "  架构: $(tbold)$ARCHITECTURE$(treset)"
+  echo -e "  用户: $(tbold)$HYSTERIA_USER$(treset)"
+  
+  perform_install
+}
+
+main "$@"
