@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 #
-# install_hysteria2.sh - Hysteria2 官方增强版一键部署脚本
-# 支持随机端口、密码生成及客户端配置自动生成
-# Try `install_hysteria2.sh --help` for usage.
+# install_server.sh - hysteria server install script with random config
+# Try `install_server.sh --help` for usage.
 #
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2023 Aperture Internet Laboratory & 增强功能贡献者
+# Copyright (c) 2023 Aperture Internet Laboratory & 改进贡献者
 #
 
 set -e
@@ -15,7 +14,7 @@ set -e
 # SCRIPT CONFIGURATION
 ###
 
-# 基础配置（继承官方脚本）
+# 基础配置
 SCRIPT_NAME="$(basename "$0")"
 EXECUTABLE_INSTALL_PATH="/usr/local/bin/hysteria"
 SYSTEMD_SERVICES_DIR="/etc/systemd/system"
@@ -24,10 +23,11 @@ REPO_URL="https://github.com/apernet/hysteria"
 HY2_API_BASE_URL="https://api.hy2.io/v1"
 CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
 
-# 增强功能配置
-ENABLE_RANDOM_CONFIG="true"         # 启用随机配置生成
+# 随机配置参数
+ENABLE_RANDOM_CONFIG="true"         # 启用随机配置
 RANDOM_PORT_MIN=1000                # 随机端口最小值
 RANDOM_PORT_MAX=65535               # 随机端口最大值
+PASSWORD_LENGTH=16                  # 密码长度
 CLIENT_CONFIG_OUTPUT_DIR="$CONFIG_DIR"  # 客户端配置输出目录
 
 
@@ -51,11 +51,11 @@ OPERATION=
 VERSION=
 FORCE=
 LOCAL_FILE=
-DISABLE_RANDOM_CONFIG=           # 禁用随机配置生成
+DISABLE_RANDOM_CONFIG=           # 禁用随机配置
 
 
 ###
-# 工具函数
+# COMMAND REPLACEMENT & UTILITIES
 ###
 
 has_command() {
@@ -67,46 +67,42 @@ curl() {
   command curl "${CURL_FLAGS[@]}" "$@"
 }
 
-tred() {
+mktemp() {
+  command mktemp "$@" "/tmp/hyservinst.XXXXXXXXXX"
+}
+
+tput() {
   if has_command tput; then
-    tput setaf 1
+    command tput "$@"
   fi
-  echo -n
+}
+
+tred() {
+  tput setaf 1
 }
 
 tgreen() {
-  if has_command tput; then
-    tput setaf 2
-  fi
-  echo -n
+  tput setaf 2
 }
 
 tyellow() {
-  if has_command tput; then
-    tput setaf 3
-  fi
-  echo -n
+  tput setaf 3
 }
 
 tblue() {
-  if has_command tput; then
-    tput setaf 4
-  fi
-  echo -n
+  tput setaf 4
+}
+
+taoi() {
+  tput setaf 6
 }
 
 tbold() {
-  if has_command tput; then
-    tput bold
-  fi
-  echo -n
+  tput bold
 }
 
 treset() {
-  if has_command tput; then
-    tput sgr0
-  fi
-  echo -n
+  tput sgr0
 }
 
 note() {
@@ -124,6 +120,12 @@ error() {
   echo -e "$SCRIPT_NAME: $(tred)error: $_msg$(treset)"
 }
 
+has_prefix() {
+    local _s="$1"
+    local _prefix="$2"
+    [[ "x$_s" != "x${_s#"$_prefix"}" ]]
+}
+
 systemctl() {
   if [[ "x$FORCE_NO_SYSTEMD" == "x2" ]] || ! has_command systemctl; then
     warning "Ignored systemd command: systemctl $@"
@@ -132,37 +134,112 @@ systemctl() {
   command systemctl "$@"
 }
 
+chcon() {
+  if ! has_command chcon || [[ "x$FORCE_NO_SELINUX" == "x1" ]]; then
+    return
+  fi
+  command chcon "$@"
+}
+
+get_systemd_version() {
+  if ! has_command systemctl; then
+    return
+  fi
+  command systemctl --version | head -1 | cut -d ' ' -f 2
+}
+
+systemd_unit_working_directory() {
+  local _systemd_version="$(get_systemd_version || true)"
+  if [[ -n "$_systemd_version" && "$_systemd_version" -lt "227" ]]; then
+    echo "$HYSTERIA_HOME_DIR"
+  else
+    echo "~"
+  fi
+}
+
+get_selinux_context() {
+  local _file="$1"
+  local _lsres="$(ls -dZ "$_file" | head -1)"
+  local _sectx=''
+  case "$(echo "$_lsres" | wc -w)" in
+    2) _sectx="$(echo "$_lsres" | cut -d ' ' -f 1)" ;;
+    5) _sectx="$(echo "$_lsres" | cut -d ' ' -f 4)" ;;
+  esac
+  [[ "x$_sectx" == "x?" ]] && _sectx=""
+  echo "$_sectx"
+}
+
+show_argument_error_and_exit() {
+  local _error_msg="$1"
+  error "$_error_msg"
+  echo "Try \"$0 --help\" for usage." >&2
+  exit 22
+}
+
+install_content() {
+  local _install_flags="$1"
+  local _content="$2"
+  local _destination="$3"
+  local _overwrite="$4"
+  local _tmpfile="$(mktemp)"
+  echo -ne "Install $_destination ... "
+  echo "$_content" > "$_tmpfile"
+  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
+    echo -e "exists"
+  elif install "$_install_flags" "$_tmpfile" "$_destination"; then
+    echo -e "ok"
+  fi
+  rm -f "$_tmpfile"
+}
+
+remove_file() {
+  local _target="$1"
+  echo -ne "Remove $_target ... "
+  if rm "$_target"; then
+    echo -e "ok"
+  fi
+}
+
+exec_sudo() {
+  local _saved_ifs="$IFS"
+  IFS=$'\n'
+  local _preserved_env=(
+    $(env | grep "^PACKAGE_MANAGEMENT_INSTALL=" || true)
+    $(env | grep "^OPERATING_SYSTEM=" || true)
+    $(env | grep "^ARCHITECTURE=" || true)
+    $(env | grep "^HYSTERIA_\w*=" || true)
+    $(env | grep "^SECONTEXT_SYSTEMD_UNIT=" || true)
+    $(env | grep "^FORCE_\w*=" || true)
+  )
+  IFS="$_saved_ifs"
+  exec sudo env "${_preserved_env[@]}" "$@"
+}
+
 detect_package_manager() {
   if [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]]; then
     return 0
   fi
-
   if has_command apt; then
     apt update
     PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install'
     return 0
   fi
-
   if has_command dnf; then
     PACKAGE_MANAGEMENT_INSTALL='dnf -y install'
     return 0
   fi
-
   if has_command yum; then
     PACKAGE_MANAGEMENT_INSTALL='yum -y install'
     return 0
   fi
-
   if has_command zypper; then
     PACKAGE_MANAGEMENT_INSTALL='zypper install -y --no-recommends'
     return 0
   fi
-
   if has_command pacman; then
     PACKAGE_MANAGEMENT_INSTALL='pacman -Syu --noconfirm'
     return 0
   fi
-
   return 1
 }
 
@@ -172,13 +249,41 @@ install_software() {
     error "不支持的包管理器，请手动安装: $_package_name"
     exit 65
   fi
-  echo "正在安装依赖: $_package_name ..."
+  echo "安装依赖: $_package_name ..."
   if $PACKAGE_MANAGEMENT_INSTALL "$_package_name"; then
     echo "完成"
   else
     error "安装依赖失败，请手动安装 $_package_name"
     exit 65
   fi
+}
+
+is_user_exists() {
+  local _user="$1"
+  id "$_user" > /dev/null 2>&1
+}
+
+rerun_with_sudo() {
+  if ! has_command sudo; then
+    return 13
+  fi
+  local _target_script
+  if has_prefix "$0" "/dev/" || has_prefix "$0" "/proc/"; then
+    local _tmp_script="$(mktemp)"
+    chmod +x "$_tmp_script"
+    if has_command curl; then
+      curl -o "$_tmp_script" 'https://get.hy2.sh/'
+    elif has_command wget; then
+      wget -O "$_tmp_script" 'https://get.hy2.sh'
+    else
+      return 127
+    fi
+    _target_script="$_tmp_script"
+  else
+    _target_script="$0"
+  fi
+  note "将使用sudo重新运行脚本"
+  exec_sudo "$_target_script" "${SCRIPT_ARGS[@]}"
 }
 
 check_permission() {
@@ -191,539 +296,191 @@ check_permission() {
       warning "FORCE_NO_ROOT=1，将以当前用户继续，但可能出现权限不足"
       ;;
     *)
-      if ! has_command sudo; then
+      if ! rerun_with_sudo; then
         error "请使用root用户或安装sudo"
         exit 13
       fi
-      note "将使用sudo重新运行脚本"
-      local _tmp_script=$(mktemp)
-      chmod +x "$_tmp_script"
-      if has_command curl; then
-        curl -o "$_tmp_script" "$0"
-      elif has_command wget; then
-        wget -O "$_tmp_script" "$0"
-      else
-        error "未安装curl或wget，无法重新运行"
-        exit 127
-      fi
-      exec sudo env "$0=$_tmp_script" "$@"
       ;;
   esac
 }
 
-check_environment() {
+check_environment_operating_system() {
   if [[ -n "$OPERATING_SYSTEM" ]]; then
-    warning "已指定OPERATING_SYSTEM=$OPERATING_SYSTEM，跳过系统检测"
-  elif [[ "x$(uname)" != "xLinux" ]]; then
-    error "仅支持Linux系统"
-    exit 95
-  else
+    warning "OPERATING_SYSTEM=$OPERATING_SYSTEM，跳过系统检测"
+  elif [[ "x$(uname)" == "xLinux" ]]; then
     OPERATING_SYSTEM=linux
+  else
+    error "仅支持Linux系统"
+    note "指定OPERATING_SYSTEM=[linux|darwin|freebsd|windows] 绕过检测"
+    exit 95
   fi
+}
 
+check_environment_architecture() {
   if [[ -n "$ARCHITECTURE" ]]; then
-    warning "已指定ARCHITECTURE=$ARCHITECTURE，跳过架构检测"
+    warning "ARCHITECTURE=$ARCHITECTURE，跳过架构检测"
   else
     case "$(uname -m)" in
-      'i386' | 'i686') ARCHITECTURE='386' ;;
-      'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
-      'armv5tel' | 'armv6l' | 'armv7' | 'armv7l') ARCHITECTURE='arm' ;;
-      'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
-      'mips' | 'mipsle' | 'mips64' | 'mips64le') ARCHITECTURE='mipsle' ;;
+      'i386'|'i686') ARCHITECTURE='386' ;;
+      'amd64'|'x86_64') ARCHITECTURE='amd64' ;;
+      'armv5tel'|'armv6l'|'armv7'|'armv7l') ARCHITECTURE='arm' ;;
+      'armv8'|'aarch64') ARCHITECTURE='arm64' ;;
+      'mips'|'mipsle'|'mips64'|'mips64le') ARCHITECTURE='mipsle' ;;
       's390x') ARCHITECTURE='s390x' ;;
       'loongarch64') ARCHITECTURE='loong64' ;;
       *)
         error "不支持的架构: $(uname -m)"
+        note "指定ARCHITECTURE=<架构> 绕过检测"
         exit 8
         ;;
     esac
   fi
+}
 
+check_environment_systemd() {
   if [[ -d "/run/systemd/system" ]] || grep -q systemd <(ls -l /sbin/init); then
-    :
-  else
-    case "$FORCE_NO_SYSTEMD" in
-      '1') warning "FORCE_NO_SYSTEMD=1，将继续假设systemd存在" ;;
-      '2') warning "FORCE_NO_SYSTEMD=2，将跳过所有systemd操作" ;;
-      *)
-        error "仅支持systemd系统"
-        exit 95
-        ;;
-    esac
+    return
   fi
-
-  if has_command getenforce; then
-    note "检测到SELinux"
-    if [[ "x$FORCE_NO_SELINUX" == "x1" ]]; then
-      warning "FORCE_NO_SELINUX=1，将跳过SELinux操作"
-    elif [[ -z "$SECONTEXT_SYSTEMD_UNIT" ]] && [[ -e "$SYSTEMD_SERVICES_DIR" ]]; then
-      SECONTEXT_SYSTEMD_UNIT=$(get_selinux_context "$SYSTEMD_SERVICES_DIR")
-    fi
-  fi
-
-  if ! has_command curl; then
-    install_software curl
-  fi
-}
-
-get_selinux_context() {
-  local _file="$1"
-  local _lsres=$(ls -dZ "$_file" 2>/dev/null | head -1)
-  local _sectx=''
-  case "$(echo "$_lsres" | wc -w)" in
-    2) _sectx=$(echo "$_lsres" | cut -d ' ' -f 1) ;;
-    5) _sectx=$(echo "$_lsres" | cut -d ' ' -f 4) ;;
+  case "$FORCE_NO_SYSTEMD" in
+    '1') warning "FORCE_NO_SYSTEMD=1，假设systemd存在" ;;
+    '2') warning "FORCE_NO_SYSTEMD=2，跳过所有systemd操作" ;;
+    *)
+      error "仅支持systemd系统"
+      note "指定FORCE_NO_SYSTEMD=1/2 绕过检测"
+      exit 95
+      ;;
   esac
-  echo "$_sectx"
 }
 
-
-###
-# 增强功能：随机配置生成
-###
-
-# 生成随机端口
-generate_random_port() {
-  if [[ "$DISABLE_RANDOM_CONFIG" == "true" ]]; then
-    echo "443"
+check_environment_selinux() {
+  if ! has_command getenforce; then
     return
   fi
-  echo $((RANDOM_PORT_MIN + RANDOM % (RANDOM_PORT_MAX - RANDOM_PORT_MIN + 1)))
-}
-
-# 生成随机密码
-generate_random_password() {
-  if [[ "$DISABLE_RANDOM_CONFIG" == "true" ]]; then
-    echo "hysteria2_default_password"
+  note "检测到SELinux"
+  if [[ "x$FORCE_NO_SELINUX" == "x1" ]]; then
+    warning "FORCE_NO_SELINUX=1，跳过SELinux操作"
     return
   fi
-  dd if=/dev/random bs=16 count=1 status=none | base64 | tr -d '+/=' | cut -c1-16
-}
-
-# 生成客户端配置URI
-generate_client_uri() {
-  local server_ip=$(curl -s ifconfig.me)
-  local port=$(generate_random_port)
-  local auth_pass=$(generate_random_password)
-  local obfs_pass=$(generate_random_password)
-  echo "hysteria2://${auth_pass}@${server_ip}:${port}/?obfs=salamander&obfs-password=${obfs_pass}&insecure=1"
-}
-
-# 输出客户端配置信息
-output_client_config() {
-  local uri=$(generate_client_uri)
-  local server_ip=$(echo $uri | grep -oP '@[^:]+:' | cut -d@ -f2 | cut -d: -f1)
-  local port=$(echo $uri | grep -oP ':\d+' | cut -d: -f2)
-  local auth_pass=$(echo $uri | grep -oP '@[^:]+:' | cut -d@ -f2 | cut -d: -f1)
-  local obfs_pass=$(echo $uri | grep -oP 'obfs-password=[^&]+' | cut -d= -f2)
-  
-  mkdir -p "$CLIENT_CONFIG_OUTPUT_DIR"
-  cat > "$CLIENT_CONFIG_OUTPUT_DIR/client_info.txt" << EOF
-==== Hysteria2 客户端配置信息 ====
-服务器IP: ${server_ip}
-随机端口: ${port}
-认证密码: ${auth_pass}
-混淆密码: ${obfs_pass}
-
-客户端连接URI:
-${uri}
-
-使用说明:
-1. 将URI导入Hysteria2客户端（需允许不安全连接）
-2. 或手动配置:
-   - 服务器地址: ${server_ip}:${port}
-   - 认证密码: ${auth_pass}
-   - 混淆类型: salamander
-   - 混淆密码: ${obfs_pass}
-   - 安全设置: 忽略证书验证
-EOF
-  
-  echo -e "\n$(tgreen)客户端配置已保存至: $(tbold)$CLIENT_CONFIG_OUTPUT_DIR/client_info.txt$(treset)"
-  echo -e "$(tgreen)URI链接:$(treset) $(tblue)$uri$(treset)"
-  
-  # 尝试生成二维码
-  if has_command qrencode; then
-    echo -e "\n$(tgreen)扫描二维码导入配置:$(treset)"
-    qrencode -t ansiutf8 "$uri"
+  if [[ -z "$SECONTEXT_SYSTEMD_UNIT" ]] && [[ -e "$SYSTEMD_SERVICES_DIR" ]]; then
+    local _sectx="$(get_selinux_context "$SYSTEMD_SERVICES_DIR")"
+    [[ -n "$_sectx" ]] && SECONTEXT_SYSTEMD_UNIT="$_sectx"
   fi
 }
 
-# 生成配置文件内容
-tpl_etc_hysteria_config_yaml() {
-  local port=$(generate_random_port)
-  local auth_pass=$(generate_random_password)
-  local obfs_pass=$(generate_random_password)
-  
-  cat << EOF
-# Hysteria2 自动配置 (随机生成)
-listen: :$port
-
-auth:
-  type: password
-  password: $auth_pass
-
-obfs:
-  type: salamander
-  salamander:
-    password: $obfs_pass
-
-# 证书配置（建议使用ACME自动申请）
-# acme:
-#   domains:
-#     - your.domain.com
-#   email: your@email.com
-
-# 带宽限制 (可选)
-# bandwidth:
-#   up: 100 mbps
-#   down: 100 mbps
-
-# QUIC配置 (可选)
-# quic:
-#   initialStreamReceiveWindow: 8388608
-#   maxStreamReceiveWindow: 8388608
-#   initialConnectionReceiveWindow: 20971520
-#   maxConnectionReceiveWindow: 20971520
-EOF
-}
-
-
-###
-# 版本相关函数
-###
-
-is_hysteria_installed() {
-  [[ -f "$EXECUTABLE_INSTALL_PATH" || -h "$EXECUTABLE_INSTALL_PATH" ]]
-}
-
-is_hysteria1_version() {
-  local _version="$1"
-  [[ "$_version" == v1.* || "$_version" == v0.* ]]
-}
-
-get_installed_version() {
-  if is_hysteria_installed; then
-    if "$EXECUTABLE_INSTALL_PATH" version > /dev/null 2>&1; then
-      "$EXECUTABLE_INSTALL_PATH" version | grep '^Version' | grep -o 'v[.0-9]*'
-    elif "$EXECUTABLE_INSTALL_PATH" -v > /dev/null 2>&1; then
-      "$EXECUTABLE_INSTALL_PATH" -v | cut -d ' ' -f 3
-    fi
-  fi
-}
-
-get_latest_version() {
-  if [[ -n "$VERSION" ]]; then
-    echo "$VERSION"
+check_environment_curl() {
+  if has_command curl; then
     return
   fi
-
-  local _tmpfile=$(mktemp)
-  if ! curl -sS "$HY2_API_BASE_URL/update?cver=installscript&plat=${OPERATING_SYSTEM}&arch=${ARCHITECTURE}&chan=release&side=server" -o "$_tmpfile"; then
-    error "无法获取最新版本信息，请检查网络"
-    exit 11
-  fi
-
-  local _latest_version=$(grep -oP '"lver":\s*\K"v.*?"' "$_tmpfile" | head -1)
-  _latest_version=${_latest_version#'"'}
-  _latest_version=${_latest_version%'"'}
-
-  if [[ -n "$_latest_version" ]]; then
-    echo "$_latest_version"
-  else
-    error "无法解析版本信息，使用默认版本"
-    echo "v2.6.1"
-  fi
-
-  rm -f "$_tmpfile"
+  install_software curl
 }
 
-check_update() {
-  local _installed=$(get_installed_version)
-  local _latest=$(get_latest_version)
-  
-  echo -ne "已安装版本: "
-  if [[ -n "$_installed" ]]; then
-    echo "$_installed"
-  else
-    echo "未安装"
+check_environment_grep() {
+  if has_command grep; then
+    return
   fi
+  install_software grep
+}
 
-  echo -ne "最新版本: "
-  echo "$_latest"
+check_environment() {
+  check_environment_operating_system
+  check_environment_architecture
+  check_environment_systemd
+  check_environment_selinux
+  check_environment_curl
+  check_environment_grep
+}
 
-  if [[ -z "$_installed" || $(vercmp "$_installed" "$_latest") -lt 0 ]]; then
-    return 0  # 有更新
+vercmp_segment() {
+  local _lhs="$1"
+  local _rhs="$2"
+  if [[ "x$_lhs" == "x$_rhs" ]]; then
+    echo 0
+    return
   fi
-  return 1  # 已是最新
+  if [[ -z "$_lhs" ]]; then
+    echo -1
+    return
+  fi
+  if [[ -z "$_rhs" ]]; then
+    echo 1
+    return
+  fi
+  local _lhs_num="${_lhs//[A-Za-z]*/}"
+  local _rhs_num="${_rhs//[A-Za-z]*/}"
+  if [[ "x$_lhs_num" == "x$_rhs_num" ]]; then
+    echo 0
+    return
+  fi
+  if [[ -z "$_lhs_num" ]]; then
+    echo -1
+    return
+  fi
+  if [[ -z "$_rhs_num" ]]; then
+    echo 1
+    return
+  fi
+  local _numcmp=$(($_lhs_num - $_rhs_num))
+  if [[ "$_numcmp" -ne 0 ]]; then
+    echo "$_numcmp"
+    return
+  fi
+  local _lhs_suffix="${_lhs#"$_lhs_num"}"
+  local _rhs_suffix="${_rhs#"$_rhs_num"}"
+  if [[ "x$_lhs_suffix" == "x$_rhs_suffix" ]]; then
+    echo 0
+    return
+  fi
+  if [[ -z "$_lhs_suffix" ]]; then
+    echo 1
+    return
+  fi
+  if [[ -z "$_rhs_suffix" ]]; then
+    echo -1
+    return
+  fi
+  [[ "$_lhs_suffix" < "$_rhs_suffix" ]] && echo -1 || echo 1
 }
 
 vercmp() {
   local _lhs=${1#v}
   local _rhs=${2#v}
-  local _clhs _crhs _segcmp
-
   while [[ -n "$_lhs" && -n "$_rhs" ]]; do
-    _clhs=${_lhs/.*/}
-    _crhs=${_rhs/.*/}
-
-    _clhs=${_clhs//[A-Za-z]*/}
-    _crhs=${_crhs//[A-Za-z]*/}
-
-    if [[ "$_clhs" -ne "$_crhs" ]]; then
-      echo $((_clhs - _crhs))
+    local _clhs="${_lhs/.*/}"
+    local _crhs="${_rhs/.*/}"
+    local _segcmp="$(vercmp_segment "$_clhs" "$_crhs")"
+    if [[ "$_segcmp" -ne 0 ]]; then
+      echo "$_segcmp"
       return
     fi
-
-    _lhs=${_lhs#"$_clhs"}
-    _lhs=${_lhs#.}
-    _rhs=${_rhs#"$_crhs"}
-    _rhs=${_rhs#.}
+    _lhs="${_lhs#"$_clhs"}"
+    _lhs="${_lhs#.}"
+    _rhs="${_rhs#"$_crhs"}"
+    _rhs="${_rhs#.}"
   done
-
-  if [[ -z "$_lhs" && -z "$_rhs" ]]; then
+  if [[ "x$_lhs" == "x$_rhs" ]]; then
     echo 0
-  elif [[ -z "$_lhs" ]]; then
-    echo -1
-  else
-    echo 1
-  fi
-}
-
-
-###
-# 安装与服务管理
-###
-
-perform_install_hysteria_binary() {
-  if [[ -n "$LOCAL_FILE" ]]; then
-    note "安装本地二进制文件: $LOCAL_FILE"
-    if install -Dm755 "$LOCAL_FILE" "$EXECUTABLE_INSTALL_PATH"; then
-      echo "安装成功"
-    else
-      error "安装失败"
-      exit 2
-    fi
     return
   fi
-
-  local _tmpfile=$(mktemp)
-  local _version=$(get_latest_version)
-
-  echo "下载 hysteria 二进制文件: $_version ..."
-  if ! download_hysteria "$_version" "$_tmpfile"; then
-    rm -f "$_tmpfile"
-    exit 11
-  fi
-
-  if install -Dm755 "$_tmpfile" "$EXECUTABLE_INSTALL_PATH"; then
-    echo "安装成功"
-  else
-    error "安装失败"
-    exit 13
-  fi
-
-  rm -f "$_tmpfile"
+  [[ -z "$_lhs" ]] && echo -1 || echo 1
 }
 
-download_hysteria() {
-  local _version="$1"
-  local _destination="$2"
-  local _download_url="$REPO_URL/releases/download/app/$_version/hysteria-$OPERATING_SYSTEM-$ARCHITECTURE"
-  
-  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
-    error "下载失败，请检查网络连接"
-    return 11
-  fi
-  return 0
-}
-
-perform_install_hysteria_config() {
-  # 生成随机配置并安装
-  install_content -Dm644 "$(tpl_etc_hysteria_config_yaml)" "$CONFIG_DIR/config.yaml" "1"
-  echo -e "$(tgreen)随机配置生成成功:$(treset) $(tbold)$CONFIG_DIR/config.yaml$(treset)"
-}
-
-# 安装systemd服务文件
-perform_install_hysteria_systemd() {
-  if [[ "x$FORCE_NO_SYSTEMD" == "x2" ]]; then
+check_hysteria_user() {
+  local _default_hysteria_user="$1"
+  if [[ -n "$HYSTERIA_USER" ]]; then
     return
   fi
-
-  install_content -Dm644 "$(tpl_hysteria_server_service)" "$SYSTEMD_SERVICES_DIR/hysteria-server.service" "1"
-  install_content -Dm644 "$(tpl_hysteria_server_x_service)" "$SYSTEMD_SERVICES_DIR/hysteria-server@.service" "1"
-  
-  if [[ -n "$SECONTEXT_SYSTEMD_UNIT" ]]; then
-    chcon "$SECONTEXT_SYSTEMD_UNIT" "$SYSTEMD_SERVICES_DIR/hysteria-server.service"
-    chcon "$SECONTEXT_SYSTEMD_UNIT" "$SYSTEMD_SERVICES_DIR/hysteria-server@.service"
+  if [[ ! -e "$SYSTEMD_SERVICES_DIR/hysteria-server.service" ]]; then
+    HYSTERIA_USER="$_default_hysteria_user"
+    return
   fi
-
-  systemctl daemon-reload
+  HYSTERIA_USER="$(grep -o '^User=\w*' "$SYSTEMD_SERVICES_DIR/hysteria-server.service" | tail -1 | cut -d '=' -f 2 || true)"
+  [[ -z "$HYSTERIA_USER" ]] && HYSTERIA_USER="$_default_hysteria_user"
 }
 
-# 模板：hysteria-server.service
-tpl_hysteria_server_service() {
-  cat << EOF
-[Unit]
-Description=Hysteria Server Service
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=$EXECUTABLE_INSTALL_PATH server --config $CONFIG_DIR/config.yaml
-WorkingDirectory=$HYSTERIA_HOME_DIR
-User=$HYSTERIA_USER
-Group=$HYSTERIA_USER
-Environment=HYSTERIA_LOG_LEVEL=info
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-# 模板：hysteria-server@.service
-tpl_hysteria_server_x_service() {
-  cat << EOF
-[Unit]
-Description=Hysteria Server Service (%i)
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=$EXECUTABLE_INSTALL_PATH server --config $CONFIG_DIR/%i.yaml
-WorkingDirectory=$HYSTERIA_HOME_DIR
-User=$HYSTERIA_USER
-Group=$HYSTERIA_USER
-Environment=HYSTERIA_LOG_LEVEL=info
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-# 安装内容到目标位置
-install_content() {
-  local _install_flags="$1"
-  local _content="$2"
-  local _destination="$3"
-  local _overwrite="${4:-}"
-
-  local _tmpfile=$(mktemp)
-  echo "$_content" > "$_tmpfile"
-
-  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
-    echo -e "已存在: $_destination"
-  elif install $_install_flags "$_tmpfile" "$_destination"; then
-    echo -e "已安装: $_destination"
-  else
-    echo -e "安装失败: $_destination"
-    return 1
+check_hysteria_homedir() {
+  local _default_hysteria_homedir="$1"
+  if [[ -n "$HYSTERIA_HOME_DIR" ]]; then
+    return
   fi
-
-  rm -f "$_tmpfile"
-}
-
-# 启动服务
-start_service() {
-  echo -ne "启动Hysteria服务 ... "
-  systemctl start hysteria-server.service
-  systemctl enable hysteria-server.service
-  echo "完成"
-}
-
-# 检查服务状态
-check_service_status() {
-  echo -e "\n$(tbold)检查Hysteria服务状态:$(treset)"
-  systemctl status hysteria-server.service --no-pager || true
-}
-
-
-###
-# 主函数
-###
-
-perform_install() {
-  echo -e "$(tbold)开始安装Hysteria2$(treset)"
-  
-  # 安装二进制文件
-  perform_install_hysteria_binary
-  
-  # 安装配置文件
-  perform_install_hysteria_config
-  
-  # 创建服务用户
-  if ! id "$HYSTERIA_USER" &>/dev/null; then
-    echo -e "\n$(tbold)创建服务用户: $HYSTERIA_USER$(treset)"
-    useradd -r -m -d "$HYSTERIA_HOME_DIR" -s /sbin/nologin "$HYSTERIA_USER"
-    chown -R "$HYSTERIA_USER:$HYSTERIA_USER" "$HYSTERIA_HOME_DIR"
-  fi
-  
-  # 安装systemd服务
-  perform_install_hysteria_systemd
-  
-  # 启动服务
-  start_service
-  
-  # 输出客户端配置
-  output_client_config
-  
-  # 检查服务状态
-  check_service_status
-  
-  echo -e "\n$(tgreen)Hysteria2 安装完成!$(treset)"
-  echo -e "服务配置: $(tblue)systemctl [start|stop|restart|status] hysteria-server.service$(treset)"
-  echo -e "配置文件: $(tblue)$CONFIG_DIR/config.yaml$(treset)"
-}
-
-parse_arguments() {
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --disable-random)
-        DISABLE_RANDOM_CONFIG="true"
-        ;;
-      --version)
-        VERSION="$2"
-        if [[ -z "$VERSION" ]]; then
-          error "请指定版本号"
-          exit 1
-        fi
-        shift
-        ;;
-      --help|-h)
-        echo "Hysteria2 一键部署脚本"
-        echo "用法:"
-        echo "  $0 [选项]"
-        echo "选项:"
-        echo "  --disable-random    禁用随机配置，使用默认值"
-        echo "  --version <版本>    安装指定版本"
-        echo "  --help, -h          显示此帮助信息"
-        exit 0
-        ;;
-      *)
-        error "未知参数: $1"
-        exit 1
-        ;;
-    esac
-    shift
-  done
-}
-
-main() {
-  parse_arguments "$@"
-  check_permission
-  check_environment
-  
-  echo -e "$(tgreen)系统环境检查通过:$(treset)"
-  echo -e "  操作系统: $(tbold)$OPERATING_SYSTEM$(treset)"
-  echo -e "  架构: $(tbold)$ARCHITECTURE$(treset)"
-  echo -e "  用户: $(tbold)$HYSTERIA_USER$(treset)"
-  
-  perform_install
-}
-
-main "$@"
+  if ! is_user_exists "$HYSTERIA_USER"; then
+    HYSTERIA_HOME_DIR="$_default_hysteria_homedir
